@@ -1,0 +1,393 @@
+---
+title: "Pipeline Genomics Azospirillum"
+author: "isabella"
+date: "2024-10-09"
+output: html_document
+---
+
+# Pipeline: Análise de Genomas Procariotos
+
+### Objetivos:
+
+*- Obter um grande conjunto de dados genômicos e filtrar dados que não refletem informações biológicas confiáveis.*
+
+*- Delimitar bactérias pertencentes a um mesmo gênero e avaliar a distância entre membros de uma mesma família.*
+
+*- Identificar espécies.*
+
+*- Avaliar o pangenoma do gênero.*
+
+*- Reconstruir a filogenia.*
+
+*- Analisar a presença de genes de virulência e resistência a antibióticos, relacionando-os com a filogenia.*
+
+**Observação:** Utilize o miniconda para criar os diferentes ambientes contendo os softwares necessários em cada uma das etapas. A separação em ambientes distintos, impede o conflito entre versões de um programa necessárias para a execução de um software etc.
+
+**Estrutura de pastas:**
+
+```{bash, eval=FALSE}
+genomas/
+    ├──1-assembly_fna/    # Genomas brutos em formato .fna
+    ├──2-bbmap_fasta/     # Genomas filtrados pelo BBmap
+    ├──3-quast/           # Resultados do QUAST
+    ├──4-checkm/          # Resultados do CheckM
+    ├──5-busco/           # Resultados do BUSCO
+    ├──6-prokka/          # Anotação de genomas com Prokka
+    │	    ├──err/
+    │	    ├──faa/
+    │	    ├──ffn/
+    │	    ├──fna/
+    │	    ├──fsa/
+    │	    ├──gbk/
+    │	    ├──gff/
+    │	    ├──log/
+    │	    ├──sqn/
+    │	    ├──tbl/
+    │	    ├──tsv/
+    │	    └──txt/
+    │
+    ├──7-mash/            # Análise de distância genômica 
+    │  └── distance_mash/
+    │      └── clusters/   
+    ├──8-fastani_mash/   #FastAni e Mash  
+    │  └── tree/
+    ├──9-pocp/           # Análise de POCP
+    ├──10-pyani/         # Análise de ANI com PyANI
+    ├──11.roary/         # Análise do Pangenoma com Roary
+    ├──12-orthofinder/   # Ortologia filogenética 
+    ├──13-iqtree/        # Reconstrução filogenética 
+    ├──14-viruloma/      # Análise de genes de virulência
+    └──15-resistoma/     # Análise de genes de resistência 
+scripts/                 # Onde o script está sendo executado       
+
+# para criar as pastas automaticamente, use o script createfolders.sh, dentro da pasta scripts/
+```
+
+# Análise para família
+
+## 1. Download de Genomas
+
+### 1.1. Configuração do Ambiente Conda para Entrez Observação: Estas análises foram iniciadas com genomas de uma mesma família.
+
+Crie um ambiente Conda para usar o entrez-direct:
+
+```{bash, eval=FALSE}
+conda create -n entrez -c bioconda entrez-direct 
+conda activate entrez
+```
+
+### 1.2. Download de Metadados
+
+Identifique o taxon ID de interesse no NCBI (exemplo: família Azospirillaceae, taxon ID 2829815). Use o script abaixo para baixar os metadados:
+
+```{bash, eval=FALSE}
+# Defina o taxon ID da família de interesse
+TAXON_ID="2829815"
+
+# Baixe a lista de genomas
+GENOMAS=$(esearch -db assembly -query "txid${TAXON_ID}[orgn]" | efetch -format docsum | xtract -pattern DocumentSummary -element BioSampleAccn)
+
+# Crie um arquivo para armazenar os metadados
+MDATA="genomas/metadados_genomas.tab"
+echo -e "Accession\tBioproject\tBioSample\tOrganism\tStrain\tHost\tIsolation\tLocation" > ${MDATA}
+
+# Coleta de metadados
+for BIOSAMPLE in ${GENOMAS[@]}; do
+    DOCSUM=$(esearch -db biosample -query ${BIOSAMPLE} | efetch -format docsum)
+    DOCSUM2=$(esearch -db assembly -query ${BIOSAMPLE} | efetch -format docsum)
+    ACCESSION=$(echo ${DOCSUM2} | xtract -pattern DocumentSummary -element AssemblyAccession)
+    BIOPROJECT=$(echo ${DOCSUM2} | xtract -pattern DocumentSummary -element BioprojectAccn)
+    ORGANISM=$(echo ${DOCSUM} | xtract -pattern BioSample -block Organism -element Organism@taxonomy_name)
+    STRAIN=$(echo ${DOCSUM} | xtract -pattern BioSample -block Attribute -if Attribute@harmonized_name -equals strain -element Attribute)
+    HOST=$(echo ${DOCSUM} | xtract -pattern BioSample -block Attribute -if Attribute@harmonized_name -equals host -element Attribute)
+    ISOLATION=$(echo ${DOCSUM} | xtract -pattern BioSample -block Attribute -if Attribute@harmonized_name -equals isolation_source -element Attribute)
+    LOCATION=$(echo ${DOCSUM} | xtract -pattern BioSample -block Attribute -if Attribute@harmonized_name -equals geo_loc_name -element Attribute)
+    echo -e "${ACCESSION}\t${BIOPROJECT}\t${BIOSAMPLE}\t${ORGANISM}\t${STRAIN}\t${HOST}\t${ISOLATION}\t${LOCATION}" >> ${MDATA}
+done
+```
+
+### 1.3. Download de Genomas (.fna)
+
+Baixe os genomas no formato .fna:
+
+```{bash, eval=FALSE}
+esearch -db assembly -query "txid${TAXON_ID}[orgn]" | esummary | xtract -pattern DocumentSummary -element FtpPath_GenBank | while read -r line; do
+    fname=$(echo $line | grep -o 'GCA_.*' | sed 's/$/_genomic.fna.gz/')
+    wget "$line/$fname" -P genomas/1-assembly_fna/
+done
+```
+
+## 2. Filtragem de Genomas
+
+### 2.1. Filtragem com BBmap
+
+Remova contigs com menos de 500 pb com BBmap
+
+```{bash, eval=FALSE}
+# Crie um ambiente conda para o BBmap
+conda create -n genome_filtering -c bioconda bbmap
+conda activate genome_filtering
+
+# Filtragem de contigs
+perl -e '@l=<genomas/1-assembly_fna/*.fna>; foreach my $d(@l){$cmd="reformat.sh in=$d out=genomas/2-bbmap_fasta/$(basename $d .fna).fasta minlength=500"; print STDERR "$cmd\n"; system $cmd; }'
+```
+
+### 2.2. Avaliação de Qualidade com QUAST
+
+Avalie a fragmentação dos genomas:
+
+```{bash, eval=FALSE}
+conda create -n quast -c bioconda quast
+quast.py genomas/2-bbmap_fasta/*.fasta -o genomas/3-quast/
+```
+
+### 2.3. Avaliação de Completude e Contaminação com CheckM
+
+Avalie a completude e contaminação dos genomas:
+
+```{bash, eval=FALSE}
+conda install -c bioconda checkm
+checkm taxon_list --rank 'family' #Identifique a família de interesse
+checkm taxonomy_wf family Rhodospirillaceae -x fasta -t 45 genomas/2-bbmap_fasta/ genomas/4-checkm/
+```
+
+### 2.4. Avaliação de Genes Conservados com BUSCO
+
+Avalie a presença de genes conservados:
+
+```{bash, eval=FALSE}
+conda create -n busco -c conda-forge -c bioconda busco=5.3.2
+conda activate busco
+
+# Rodar BUSCO para todos os genomas
+perl -e '@l=<../genomas/2-bbmap_fasta/*.fasta>; foreach my $d(@l){$cmd="busco --cpu 50 -o $(basename $d .fasta) --out_path ../genomas/5-busco/ -l rhodospirillales_odb10 -m genome -i $d"; print STDERR "$cmd\n"; system $cmd; }'
+
+# Filtrar resultados
+./filtering-results-busco.sh
+```
+
+## 3. Anotação de Genomas com Prokka
+
+### 3.1. Configuração do Ambiente
+
+Crie e ative o ambiente conda para o Prokka:
+
+```{bash, eval=FALSE}
+conda create -n prokka -c conda-forge -c bioconda -c defaults prokka
+conda activate prokka
+```
+
+### 3.2. Execução do Prokka
+
+Execute o Prokka para anotar os genomas:
+
+```{bash, eval=FALSE}
+perl -e '@l=<genomas/2-bbmap_fasta/*.fasta>; foreach my $d(@l){$cmd= "prokka --cpus 50 --outdir genomas/6-prokka/ --force --prefix $(basename $d .fasta) --locustag $(basename $d .fasta) $d"; print STDERR "$cmd\n"; system $cmd; }'
+```
+
+### 3.3 Organização dos Resultados
+
+Organize os arquivos de saída em pastas específicas:
+
+```{bash, eval=FALSE}
+cd script/
+./createfoldersProkka.sh
+```
+
+Renomeie os arquivos para manter um padrão:
+
+```{bash, eval=FALSE}
+for i in *; do
+    cd $i
+    ls | perl -lne '$orig = $_; $new = s/(.*\.[0-9]).*(\.)/\1\2/r; system("mv", $orig, $new)'
+    cd ..
+done
+```
+
+## 4. Análise de Distância Mash
+
+### 4.1 Desduplicação de genomas
+
+```{bash, eval=FALSE}
+#Crie e ative o ambiente conda para o Mash:
+conda create -n mash -c bioconda mash
+conda activate mash
+```
+
+### 4.2. Execução do Mash - Desduplicação
+
+Execute o Mash para filtrar genomas com distância MASH ≤ 0.005
+
+```{bash, eval=FALSE}
+mkdir -p genomas/7-mash/distance_mash
+mash sketch -p 50 -o reference -s 50000 *.fna
+mash dist -p 50 reference.msh reference.msh > mash_distances
+```
+
+### 4.3. Filtragem de Genomas
+
+Use o script cluster_genera.py para filtrar genomas com distância MASH ≤ 0.005:
+
+```{bash, eval=FALSE}
+python cluster_genera.py ../genomas/7-mash/distance_mash
+```
+
+### 4.4 Análise de identidade com Mash e FastANI
+
+```{bash, eval=FALSE}
+# Ative o ambiente conda e instale o FastANI e Quicktree
+conda activate mash
+conda install -c bioconda fastani
+conda install -c bioconda quicktree
+# Mash
+./mash_distance_matrix.sh 52 #número de threads 
+python combine_distance_matrices.py ../genomas/8-fastani_mash/tree/mash.phylip ../genomas/8-fastani_mash/tree/fastani.phylip > ../genomas/8-fastani_mash/tree/distances.phylip
+# FastAni
+./fastani_in_parallel.sh 52
+python pairwise_identities_to_distance_matrix.py --max_dist 0.2 ../genomas/8-fastani_mash/tree/fastani_output > ../genomas/8-fastani_mash/tree/fastani.phylip
+```
+
+### 4.5 Gerando Árvore Filognética NJ
+
+```{bash, eval=FALSE}
+quicktree -in m -out t distances.phylip > tree.newick
+#Para visualizar resultado: plotar arquivo tree.newick no iTOL [https://itol.embl.de/]
+```
+
+## 5. Delimitação dos gêneros POCP
+
+Calcular a porcentagem das proteínas conservadas entre os genomas, para estabelecer o grau uma delimitação de gênero entre os grupos.
+
+```{bash, eval=FALSE}
+# Crie o ambiente conda e instale o pocp
+conda create -n pocp -c bioconda blast && conda activate pocp 
+#instalação dos executáveis do pocp dentro da pasta tools:  /scripts/pocp/
+git clone https://github.com/hoelzer/pocp.git
+
+# adicição do executável na bash //altere o caminho abaixo
+alias pocp='/usuario/Bioinfo_Procariotos_Pipeline/scripts/pocp/pocp.rb'
+
+#Para rodar o POCP, 
+pocp ../6-prokka/faa/ 9-pocp/results-pocp 22 
+```
+
+Visualize o resultado do POCP no Rstudio
+
+```{r}
+setwd("/9-pocp")
+pocp <- read.csv2("/9-pocp/results_pocp.csv", header = TRUE, sep=".")
+m <- as.matrix(pocp[,-1])
+rownames(m)<-pocp$ID
+heatmap(m)
+m
+```
+
+#### Importante: Os genomas identificados como não pertencentes ao gênero, devem ser excluídos das pastas prokka ou movidos para outro diretório.
+
+# Análises para gênero
+
+## 6. Análise de Identidade - ANI Avaliar a identidade entre os genomas de um mesmo gênero
+
+```{bash, eval=FALSE}
+# Crie o ambiente conda e instale o pyani
+conda install -c bioconda pyani
+conda activate pyani
+
+#Rodar dentro da pasta com os arquivos *.fna
+average_nucleotide_identity.py -i 10-pyani/specie_name_fna -o 10-pyani -m ANIm -g --force 
+
+```
+
+## 7. Análise do pangenoma - ROARY
+
+```{bash, eval=FALSE}
+roary -p 45 -e -n -r -g 5000000 -i 75 -cd 90 -f 11-roary 6-prokka/gff/*.gff
+
+#PARÂMETROS UTILIZADOS | -e : cria um alinhamento multiFASTA dos genes core usando PRANK; -n : alinhamento rápido dos genes core usando o alinhador MAFFT(use com -e)|-r : cria gráficos R (requer R e ggplot2) | -cd : porcentagem de isolados em que um gene deve estar para ser core |-p : número de threads | -i : identidade percentual mínima para blastp | -g : número máximo de clusters [50000]
+
+```
+
+## 8. Ortologia filogenética - Orthofinder
+
+Inferência de ortologia filogenética
+
+```{bash, eval=FALSE}
+conda create orthofinder
+conda install -c bioconda orthofinder
+
+ulimit -n 5000
+nohup orthofinder -f specie_name_faa/ -M msa -t 90
+nohup orthofinder -f specie_name_faa/ -M msa -A muscle -T iqtree -t 90
+
+#arquivo de alinhamento input IQTREE: OrthoFinder/Imports_Results_Dec02_2/MultipleSequenceAlignments/SpeciesTreeAlignment.fa
+```
+
+## 9.Árvore filogenética - IQtree
+
+```{bash, eval=FALSE}
+iqtree -s SpeciesTreeAlignment.fa -B 1000 -T 40 -v -m TEST  
+
+iqtree -m TEST -s SpeciesTreeAlignment.fa -bb 1000 -vv -nt 50
+
+```
+
+## 10.Análises de fatores de virulência
+
+VFDB e USEARCH
+
+```{bash, eval=FALSE}
+## Download do Usearch: https://www.drive5.com/usearch/
+
+#1) download db VFDB core <http://www.mgc.ac.cn/VFs/download.htm> 
+mkdir 14-viruloma/db_VFDB  
+#2) Agrupar os genes com identidade de 80% para eliminar redundância - UCLUST
+usearch -cluster_fast VFDB_setA_pro.fasta -id 0.8 -centroids VFDB-uclust.fasta -uc VFDB-uclust-clusters.uc
+
+#3) Criar uma database 'UDB dabase file' com seq_fastas a partir dos genes agrupados
+usearch -makeudb_usearch VFDB-uclust.fasta -output VFDB_DB.udb
+
+#4)rodar a db contra os genomas *.faa do prokka (50% id - 50% de cobertura);
+for i in ../../6-prokka/faa/*.faa; do echo processing $i; STEM=$(basename $i .faa); usearch -usearch_global $i -db 14-viruloma/db_VFDB/VFDB_DB.udb -top_hit_only -evalue 1.0e-05 -id 0.5 -query_cov 0.5 -target_cov 0.5 -userout $STEM\.VFDB -userfields query+target+id+evalue+qlo+qhi+tlo+thi+ql+tl+bits; done
+
+#4.1)
+for i in *.VFDB; do echo processing $i; STEM=$(basename $i .VFDB); sed -i "s/^/$STEM\t/g" $i;done
+
+#4.2) concatenar todos os resultados
+cat *.VFDB > raw_viruloma.txt
+
+#5)Rodar script em python - dê permissão e chame ele 
+# REGEX EM PYTHON PARA COLOCAR CABEÇALHO NO ARQUIVO, E TRATA-LOS POIS ALGUNS DADOS ESTÃO NO MESMO VETOR;
+python ../../scripts/virulome_script.py #output virulome_filtered.txt
+
+```
+
+## 11.Análises de fatores de resistência
+
+Detectar genes de resistência a antibiótico e correlacionar com a filogenia.
+
+CARD e USEARCH
+
+```{bash, eval=FALSE}
+# 1) download db CARD-data  <https://card.mcmaster.ca/latest/data> 
+mkdir 9-resistoma/db_card
+
+# 2) criar db 'UDB database file' com seq_fastas do card-data - arquivo de input:  protein_fasta_protein_homolog_model.fasta
+#rodar dentro da pasta card-db/
+
+usearch -makeudb_usearch protein_fasta_protein_homolog_model.fasta -output db-card.udb
+
+
+#3)rodar a db contra os genomas *.faa do prokka | 50% id - 50% de cobertura;
+
+for i in ../../6-prokka/faa/*.faa; do echo processing $i; STEM=$(basename $i .faa); usearch -usearch_global $i -db 15-resistoma/PROKKA_card/db-card.udb -top_hit_only -evalue 1.0e-05 -id 0.5 -query_cov 0.5 -target_cov 0.5 -userout $STEM\.CARD -userfields query+target+id+evalue+qlo+qhi+tlo+thi+ql+tl+bits; done
+
+#3.2)
+for i in *.CARD; do echo processing $i;STEM=$(basename $i .fasta.CARD); sed -i "s/^/$STEM\t/g" $i;done
+
+#3.2)
+cat *.CARD > raw_resistome.txt
+
+#4) Rodar script em python (ALTERA CABEÇALHOS) - (dê permissão antes)
+python  ../../../scripts/resistome_script.py
+
+```
