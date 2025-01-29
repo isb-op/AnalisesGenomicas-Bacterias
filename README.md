@@ -1,4 +1,4 @@
-# AnalisesGenomicas-Bacterias
+# Analises Genômicas para bactérias
 
 Pipeline Genomics Azospirillum
 
